@@ -1,0 +1,15 @@
+{
+	"folders": [
+		{
+			"path": "../../../../.."
+		},
+		{
+			"name": "type_master",
+			"path": "../../../../type_master"
+		},
+		{
+			"path": "../.."
+		}
+	],
+	"settings": {}
+}

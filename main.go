@@ -168,6 +168,9 @@ func scrapeFeed(s *state, feed database.Feed, wg *sync.WaitGroup) {
 	// Save posts to database
 	fmt.Printf("Found %d posts in %s\n", len(rssFeed.Channel.Item), feed.Name)
 	for _, item := range rssFeed.Channel.Item {
+		// Parse publication date
+		pubDate, _ := item.ParsePubDate()
+		
 		// Create post in database
 		_, err := s.db.CreatePost(context.Background(), database.CreatePostParams{
 			ID:          uuid.New(),
@@ -176,7 +179,7 @@ func scrapeFeed(s *state, feed database.Feed, wg *sync.WaitGroup) {
 			Title:       item.Title,
 			Url:         item.Link,
 			Description: sql.NullString{String: item.Description, Valid: item.Description != ""},
-			PublishedAt: sql.NullTime{Time: item.PubDate, Valid: !item.PubDate.IsZero()},
+			PublishedAt: sql.NullTime{Time: pubDate, Valid: !pubDate.IsZero()},
 			FeedID:      feed.ID,
 		})
 		if err != nil {
@@ -532,7 +535,7 @@ func handlerBookmark(s *state, cmd command, user database.User) error {
 		return fmt.Errorf("couldn't check bookmark status: %w", err)
 	}
 
-	if isBookmarked.IsBookmarked {
+	if isBookmarked {
 		fmt.Println("Post is already bookmarked")
 		return nil
 	}

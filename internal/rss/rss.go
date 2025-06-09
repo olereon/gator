@@ -6,6 +6,7 @@ import (
 	"html"
 	"io"
 	"net/http"
+	"time"
 )
 
 type RSSFeed struct {
@@ -22,6 +23,33 @@ type RSSItem struct {
 	Link        string `xml:"link"`
 	Description string `xml:"description"`
 	PubDate     string `xml:"pubDate"`
+}
+
+// ParsePubDate tries to parse the pubDate string into a time.Time
+func (item *RSSItem) ParsePubDate() (time.Time, error) {
+	if item.PubDate == "" {
+		return time.Time{}, nil
+	}
+
+	// Common RSS date formats
+	formats := []string{
+		time.RFC1123Z,
+		time.RFC1123,
+		"Mon, 2 Jan 2006 15:04:05 -0700",
+		"Mon, 02 Jan 2006 15:04:05 -0700",
+		"2006-01-02T15:04:05Z07:00",
+		"2006-01-02T15:04:05Z",
+		"2006-01-02 15:04:05",
+	}
+
+	for _, format := range formats {
+		if t, err := time.Parse(format, item.PubDate); err == nil {
+			return t, nil
+		}
+	}
+
+	// If all parsing fails, return zero time
+	return time.Time{}, nil
 }
 
 func FetchFeed(ctx context.Context, feedURL string) (*RSSFeed, error) {

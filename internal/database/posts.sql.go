@@ -114,3 +114,151 @@ func (q *Queries) GetPostsForUser(ctx context.Context, arg GetPostsForUserParams
 	}
 	return items, nil
 }
+
+const getPostsForUserWithPagination = `-- name: GetPostsForUserWithPagination :many
+SELECT posts.id, posts.created_at, posts.updated_at, posts.title, posts.url, posts.description, posts.published_at, posts.feed_id, feeds.name AS feed_name
+FROM posts
+INNER JOIN feeds ON posts.feed_id = feeds.id
+INNER JOIN feed_follows ON feeds.id = feed_follows.feed_id
+WHERE feed_follows.user_id = $1
+AND ($2::TEXT = '' OR feeds.name ILIKE '%' || $2 || '%')
+ORDER BY 
+  CASE WHEN $3 = 'title' THEN posts.title END ASC,
+  CASE WHEN $3 = 'title_desc' THEN posts.title END DESC,
+  CASE WHEN $3 = 'published' THEN posts.published_at END ASC NULLS LAST,
+  CASE WHEN $3 = 'published_desc' OR $3 = '' THEN posts.published_at END DESC NULLS LAST,
+  CASE WHEN $3 = 'feed' THEN feeds.name END ASC,
+  CASE WHEN $3 = 'feed_desc' THEN feeds.name END DESC,
+  posts.created_at DESC
+LIMIT $4 OFFSET $5
+`
+
+type GetPostsForUserWithPaginationParams struct {
+	UserID  uuid.UUID
+	Column2 string
+	Column3 interface{}
+	Limit   int32
+	Offset  int32
+}
+
+type GetPostsForUserWithPaginationRow struct {
+	ID          uuid.UUID
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+	Title       string
+	Url         string
+	Description sql.NullString
+	PublishedAt sql.NullTime
+	FeedID      uuid.UUID
+	FeedName    string
+}
+
+func (q *Queries) GetPostsForUserWithPagination(ctx context.Context, arg GetPostsForUserWithPaginationParams) ([]GetPostsForUserWithPaginationRow, error) {
+	rows, err := q.db.QueryContext(ctx, getPostsForUserWithPagination,
+		arg.UserID,
+		arg.Column2,
+		arg.Column3,
+		arg.Limit,
+		arg.Offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetPostsForUserWithPaginationRow
+	for rows.Next() {
+		var i GetPostsForUserWithPaginationRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.Title,
+			&i.Url,
+			&i.Description,
+			&i.PublishedAt,
+			&i.FeedID,
+			&i.FeedName,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const searchPostsForUser = `-- name: SearchPostsForUser :many
+SELECT posts.id, posts.created_at, posts.updated_at, posts.title, posts.url, posts.description, posts.published_at, posts.feed_id, feeds.name AS feed_name
+FROM posts
+INNER JOIN feeds ON posts.feed_id = feeds.id
+INNER JOIN feed_follows ON feeds.id = feed_follows.feed_id
+WHERE feed_follows.user_id = $1
+AND (
+  posts.title ILIKE '%' || $2 || '%' 
+  OR posts.description ILIKE '%' || $2 || '%'
+  OR feeds.name ILIKE '%' || $2 || '%'
+)
+ORDER BY 
+  CASE WHEN posts.title ILIKE '%' || $2 || '%' THEN 1 END,
+  CASE WHEN feeds.name ILIKE '%' || $2 || '%' THEN 2 END,
+  CASE WHEN posts.description ILIKE '%' || $2 || '%' THEN 3 END,
+  posts.published_at DESC NULLS LAST,
+  posts.created_at DESC
+LIMIT $3
+`
+
+type SearchPostsForUserParams struct {
+	UserID  uuid.UUID
+	Column2 sql.NullString
+	Limit   int32
+}
+
+type SearchPostsForUserRow struct {
+	ID          uuid.UUID
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+	Title       string
+	Url         string
+	Description sql.NullString
+	PublishedAt sql.NullTime
+	FeedID      uuid.UUID
+	FeedName    string
+}
+
+func (q *Queries) SearchPostsForUser(ctx context.Context, arg SearchPostsForUserParams) ([]SearchPostsForUserRow, error) {
+	rows, err := q.db.QueryContext(ctx, searchPostsForUser, arg.UserID, arg.Column2, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []SearchPostsForUserRow
+	for rows.Next() {
+		var i SearchPostsForUserRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.Title,
+			&i.Url,
+			&i.Description,
+			&i.PublishedAt,
+			&i.FeedID,
+			&i.FeedName,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}

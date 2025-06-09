@@ -1,11 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -142,18 +148,13 @@ func handlerUsers(s *state, cmd command) error {
 	return nil
 }
 
-func scrapeFeeds(s *state) {
-	// Get the next feed to fetch
-	feed, err := s.db.GetNextFeedToFetch(context.Background())
-	if err != nil {
-		fmt.Printf("Error getting next feed: %v\n", err)
-		return
-	}
+func scrapeFeed(s *state, feed database.Feed, wg *sync.WaitGroup) {
+	defer wg.Done()
 
 	// Mark it as fetched
-	err = s.db.MarkFeedFetched(context.Background(), feed.ID)
+	err := s.db.MarkFeedFetched(context.Background(), feed.ID)
 	if err != nil {
-		fmt.Printf("Error marking feed as fetched: %v\n", err)
+		fmt.Printf("Error marking feed %s as fetched: %v\n", feed.Name, err)
 		return
 	}
 
@@ -187,6 +188,29 @@ func scrapeFeeds(s *state) {
 	}
 }
 
+func scrapeFeeds(s *state, concurrency int) {
+	// Get multiple feeds to fetch
+	feeds, err := s.db.GetNextFeedsToFetch(context.Background(), int32(concurrency))
+	if err != nil {
+		fmt.Printf("Error getting feeds: %v\n", err)
+		return
+	}
+
+	if len(feeds) == 0 {
+		fmt.Println("No feeds to fetch")
+		return
+	}
+
+	fmt.Printf("Fetching %d feeds concurrently\n", len(feeds))
+
+	var wg sync.WaitGroup
+	for _, feed := range feeds {
+		wg.Add(1)
+		go scrapeFeed(s, feed, &wg)
+	}
+	wg.Wait()
+}
+
 func handlerAgg(s *state, cmd command) error {
 	if len(cmd.args) == 0 {
 		return errors.New("time_between_reqs is required")
@@ -197,11 +221,23 @@ func handlerAgg(s *state, cmd command) error {
 		return fmt.Errorf("invalid duration: %w", err)
 	}
 
-	fmt.Printf("Collecting feeds every %s\n", timeBetweenRequests)
+	// Default concurrency
+	concurrency := 5
+
+	// Parse optional concurrency argument
+	if len(cmd.args) > 1 {
+		if c, err := strconv.Atoi(cmd.args[1]); err == nil && c > 0 {
+			concurrency = c
+		} else {
+			return fmt.Errorf("invalid concurrency value: %s", cmd.args[1])
+		}
+	}
+
+	fmt.Printf("Collecting feeds every %s with concurrency %d\n", timeBetweenRequests, concurrency)
 
 	ticker := time.NewTicker(timeBetweenRequests)
 	for ; ; <-ticker.C {
-		scrapeFeeds(s)
+		scrapeFeeds(s, concurrency)
 	}
 }
 
@@ -333,13 +369,284 @@ func handlerUnfollow(s *state, cmd command, user database.User) error {
 }
 
 func handlerBrowse(s *state, cmd command, user database.User) error {
-	limit := int32(2)
-	if len(cmd.args) > 0 {
-		fmt.Printf("Error: browse command doesn't accept arguments\n")
+	// Default values
+	limit := int32(10)
+	offset := int32(0)
+	sortBy := "published_desc"
+	feedFilter := ""
+
+	// Parse arguments
+	for i, arg := range cmd.args {
+		if strings.HasPrefix(arg, "--limit=") {
+			if l, err := strconv.Atoi(strings.TrimPrefix(arg, "--limit=")); err == nil && l > 0 {
+				limit = int32(l)
+			}
+		} else if strings.HasPrefix(arg, "--offset=") {
+			if o, err := strconv.Atoi(strings.TrimPrefix(arg, "--offset=")); err == nil && o >= 0 {
+				offset = int32(o)
+			}
+		} else if strings.HasPrefix(arg, "--sort=") {
+			sortBy = strings.TrimPrefix(arg, "--sort=")
+		} else if strings.HasPrefix(arg, "--feed=") {
+			feedFilter = strings.TrimPrefix(arg, "--feed=")
+		} else if arg == "--help" {
+			fmt.Println("Usage: gator browse [options]")
+			fmt.Println("Options:")
+			fmt.Println("  --limit=N        Number of posts to show (default: 10)")
+			fmt.Println("  --offset=N       Number of posts to skip (default: 0)")
+			fmt.Println("  --sort=OPTION    Sort by: published_desc, published, title, title_desc, feed, feed_desc (default: published_desc)")
+			fmt.Println("  --feed=NAME      Filter by feed name (partial match)")
+			fmt.Println("  --help           Show this help")
+			return nil
+		} else if i == 0 {
+			// First argument without flag is treated as limit for backward compatibility
+			if l, err := strconv.Atoi(arg); err == nil && l > 0 {
+				limit = int32(l)
+			}
+		}
+	}
+
+	// Validate sort option
+	validSorts := map[string]bool{
+		"published_desc": true, "published": true, "title": true,
+		"title_desc": true, "feed": true, "feed_desc": true,
+	}
+	if !validSorts[sortBy] {
+		return fmt.Errorf("invalid sort option: %s. Valid options: published_desc, published, title, title_desc, feed, feed_desc", sortBy)
+	}
+
+	// Get posts for user with pagination
+	posts, err := s.db.GetPostsForUserWithPagination(context.Background(), database.GetPostsForUserWithPaginationParams{
+		UserID:  user.ID,
+		Column2: feedFilter,
+		Column3: sortBy,
+		Limit:   limit,
+		Offset:  offset,
+	})
+	if err != nil {
+		return fmt.Errorf("couldn't get posts: %w", err)
+	}
+
+	if len(posts) == 0 {
+		fmt.Println("No posts found.")
 		return nil
 	}
 
-	// Get posts for user
+	// Print posts
+	fmt.Printf("Showing %d posts (offset %d, sorted by %s", len(posts), offset, sortBy)
+	if feedFilter != "" {
+		fmt.Printf(", filtered by feed: %s", feedFilter)
+	}
+	fmt.Println(")")
+	fmt.Println()
+
+	for i, post := range posts {
+		fmt.Printf("%d. %s\n", int(offset)+i+1, post.Title)
+		if post.Description.Valid && post.Description.String != "" {
+			description := post.Description.String
+			if len(description) > 150 {
+				description = description[:147] + "..."
+			}
+			fmt.Printf("   %s\n", description)
+		}
+		fmt.Printf("   Link: %s\n", post.Url)
+		fmt.Printf("   Feed: %s\n", post.FeedName)
+		if post.PublishedAt.Valid {
+			fmt.Printf("   Published: %s\n", post.PublishedAt.Time.Format("Mon, 02 Jan 2006 15:04:05 MST"))
+		}
+		fmt.Println()
+	}
+
+	// Show pagination info
+	if len(posts) == int(limit) {
+		fmt.Printf("To see more posts, use: gator browse --offset=%d\n", offset+limit)
+	}
+
+	return nil
+}
+
+func handlerSearch(s *state, cmd command, user database.User) error {
+	if len(cmd.args) == 0 {
+		return errors.New("search query is required")
+	}
+
+	query := strings.Join(cmd.args, " ")
+	limit := int32(20)
+
+	// Search for posts
+	posts, err := s.db.SearchPostsForUser(context.Background(), database.SearchPostsForUserParams{
+		UserID:  user.ID,
+		Column2: sql.NullString{String: query, Valid: true},
+		Limit:   limit,
+	})
+	if err != nil {
+		return fmt.Errorf("couldn't search posts: %w", err)
+	}
+
+	if len(posts) == 0 {
+		fmt.Printf("No posts found for query: %s\n", query)
+		return nil
+	}
+
+	fmt.Printf("Found %d posts matching \"%s\":\n\n", len(posts), query)
+
+	for i, post := range posts {
+		fmt.Printf("%d. %s\n", i+1, post.Title)
+		if post.Description.Valid && post.Description.String != "" {
+			description := post.Description.String
+			if len(description) > 150 {
+				description = description[:147] + "..."
+			}
+			fmt.Printf("   %s\n", description)
+		}
+		fmt.Printf("   Link: %s\n", post.Url)
+		fmt.Printf("   Feed: %s\n", post.FeedName)
+		if post.PublishedAt.Valid {
+			fmt.Printf("   Published: %s\n", post.PublishedAt.Time.Format("Mon, 02 Jan 2006 15:04:05 MST"))
+		}
+		fmt.Println()
+	}
+
+	return nil
+}
+
+func handlerBookmark(s *state, cmd command, user database.User) error {
+	if len(cmd.args) == 0 {
+		return errors.New("post URL is required")
+	}
+
+	postURL := cmd.args[0]
+
+	// Find the post by URL
+	post, err := s.db.GetPostByURL(context.Background(), postURL)
+	if err != nil {
+		return fmt.Errorf("couldn't find post: %w", err)
+	}
+
+	// Check if already bookmarked
+	isBookmarked, err := s.db.IsPostBookmarked(context.Background(), database.IsPostBookmarkedParams{
+		UserID: user.ID,
+		PostID: post.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("couldn't check bookmark status: %w", err)
+	}
+
+	if isBookmarked.IsBookmarked {
+		fmt.Println("Post is already bookmarked")
+		return nil
+	}
+
+	// Create bookmark
+	_, err = s.db.CreateBookmark(context.Background(), database.CreateBookmarkParams{
+		ID:        uuid.New(),
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+		UserID:    user.ID,
+		PostID:    post.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("couldn't create bookmark: %w", err)
+	}
+
+	fmt.Printf("Bookmarked: %s\n", post.Title)
+	return nil
+}
+
+func handlerUnbookmark(s *state, cmd command, user database.User) error {
+	if len(cmd.args) == 0 {
+		return errors.New("post URL is required")
+	}
+
+	postURL := cmd.args[0]
+
+	// Find the post by URL
+	post, err := s.db.GetPostByURL(context.Background(), postURL)
+	if err != nil {
+		return fmt.Errorf("couldn't find post: %w", err)
+	}
+
+	// Delete bookmark
+	err = s.db.DeleteBookmark(context.Background(), database.DeleteBookmarkParams{
+		UserID: user.ID,
+		PostID: post.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("couldn't remove bookmark: %w", err)
+	}
+
+	fmt.Printf("Removed bookmark: %s\n", post.Title)
+	return nil
+}
+
+func handlerBookmarks(s *state, cmd command, user database.User) error {
+	limit := int32(20)
+
+	// Parse optional limit argument
+	if len(cmd.args) > 0 {
+		if l, err := strconv.Atoi(cmd.args[0]); err == nil && l > 0 {
+			limit = int32(l)
+		}
+	}
+
+	// Get bookmarks for user
+	bookmarks, err := s.db.GetBookmarksForUser(context.Background(), database.GetBookmarksForUserParams{
+		UserID: user.ID,
+		Limit:  limit,
+	})
+	if err != nil {
+		return fmt.Errorf("couldn't get bookmarks: %w", err)
+	}
+
+	if len(bookmarks) == 0 {
+		fmt.Println("No bookmarks found.")
+		return nil
+	}
+
+	fmt.Printf("Your %d bookmark(s):\n\n", len(bookmarks))
+
+	for i, bookmark := range bookmarks {
+		fmt.Printf("%d. %s\n", i+1, bookmark.Title)
+		if bookmark.Description.Valid && bookmark.Description.String != "" {
+			description := bookmark.Description.String
+			if len(description) > 150 {
+				description = description[:147] + "..."
+			}
+			fmt.Printf("   %s\n", description)
+		}
+		fmt.Printf("   Link: %s\n", bookmark.Url)
+		fmt.Printf("   Feed: %s\n", bookmark.FeedName)
+		if bookmark.PublishedAt.Valid {
+			fmt.Printf("   Published: %s\n", bookmark.PublishedAt.Time.Format("Mon, 02 Jan 2006 15:04:05 MST"))
+		}
+		fmt.Printf("   Bookmarked: %s\n", bookmark.BookmarkedAt.Format("Mon, 02 Jan 2006 15:04:05 MST"))
+		fmt.Println()
+	}
+
+	return nil
+}
+
+func openURL(url string) error {
+	var cmd string
+	var args []string
+
+	switch runtime.GOOS {
+	case "windows":
+		cmd = "cmd"
+		args = []string{"/c", "start"}
+	case "darwin":
+		cmd = "open"
+	default: // "linux", "freebsd", "openbsd", "netbsd"
+		cmd = "xdg-open"
+	}
+	args = append(args, url)
+	return exec.Command(cmd, args...).Start()
+}
+
+func handlerTUI(s *state, cmd command, user database.User) error {
+	limit := int32(10)
+
+	// Get recent posts
 	posts, err := s.db.GetPostsForUser(context.Background(), database.GetPostsForUserParams{
 		UserID: user.ID,
 		Limit:  limit,
@@ -348,21 +655,160 @@ func handlerBrowse(s *state, cmd command, user database.User) error {
 		return fmt.Errorf("couldn't get posts: %w", err)
 	}
 
-	// Print posts
-	for _, post := range posts {
-		fmt.Printf("* %s\n", post.Title)
-		if post.Description.Valid {
-			fmt.Printf("  %s\n", post.Description.String)
-		}
-		fmt.Printf("  Link: %s\n", post.Url)
-		fmt.Printf("  Feed: %s\n", post.FeedName)
-		if post.PublishedAt.Valid {
-			fmt.Printf("  Published: %s\n", post.PublishedAt.Time.Format("Mon, 02 Jan 2006 15:04:05 MST"))
-		}
-		fmt.Println()
+	if len(posts) == 0 {
+		fmt.Println("No posts found.")
+		return nil
 	}
 
-	return nil
+	reader := bufio.NewReader(os.Stdin)
+
+	for {
+		// Clear screen (works on most terminals)
+		fmt.Print("\033[2J\033[H")
+
+		fmt.Println("=== Gator TUI - Latest Posts ===")
+		fmt.Println()
+
+		// Display posts
+		for i, post := range posts {
+			fmt.Printf("%d. %s\n", i+1, post.Title)
+			if post.Description.Valid && post.Description.String != "" {
+				description := post.Description.String
+				if len(description) > 100 {
+					description = description[:97] + "..."
+				}
+				fmt.Printf("   %s\n", description)
+			}
+			fmt.Printf("   Feed: %s", post.FeedName)
+			if post.PublishedAt.Valid {
+				fmt.Printf(" | %s", post.PublishedAt.Time.Format("Jan 02"))
+			}
+			fmt.Println()
+		}
+
+		fmt.Println()
+		fmt.Println("Commands:")
+		fmt.Println("  1-10    Open post in browser")
+		fmt.Println("  r       Refresh posts")
+		fmt.Println("  s       Search posts")
+		fmt.Println("  b       View bookmarks")
+		fmt.Println("  q       Quit")
+		fmt.Print("\nEnter command: ")
+
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			return fmt.Errorf("error reading input: %w", err)
+		}
+
+		input = strings.TrimSpace(input)
+
+		switch input {
+		case "q":
+			fmt.Println("Goodbye!")
+			return nil
+
+		case "r":
+			// Refresh posts
+			posts, err = s.db.GetPostsForUser(context.Background(), database.GetPostsForUserParams{
+				UserID: user.ID,
+				Limit:  limit,
+			})
+			if err != nil {
+				fmt.Printf("Error refreshing posts: %v\n", err)
+				fmt.Print("Press Enter to continue...")
+				reader.ReadString('\n')
+			}
+
+		case "s":
+			fmt.Print("Enter search query: ")
+			query, err := reader.ReadString('\n')
+			if err != nil {
+				fmt.Printf("Error reading query: %v\n", err)
+				continue
+			}
+			query = strings.TrimSpace(query)
+			if query == "" {
+				continue
+			}
+
+			searchResults, err := s.db.SearchPostsForUser(context.Background(), database.SearchPostsForUserParams{
+				UserID:  user.ID,
+				Column2: sql.NullString{String: query, Valid: true},
+				Limit:   limit,
+			})
+			if err != nil {
+				fmt.Printf("Error searching posts: %v\n", err)
+				fmt.Print("Press Enter to continue...")
+				reader.ReadString('\n')
+				continue
+			}
+
+			// Convert search results to regular posts format
+			posts = make([]database.GetPostsForUserRow, len(searchResults))
+			for i, result := range searchResults {
+				posts[i] = database.GetPostsForUserRow{
+					ID:          result.ID,
+					CreatedAt:   result.CreatedAt,
+					UpdatedAt:   result.UpdatedAt,
+					Title:       result.Title,
+					Url:         result.Url,
+					Description: result.Description,
+					PublishedAt: result.PublishedAt,
+					FeedID:      result.FeedID,
+					FeedName:    result.FeedName,
+				}
+			}
+
+		case "b":
+			bookmarks, err := s.db.GetBookmarksForUser(context.Background(), database.GetBookmarksForUserParams{
+				UserID: user.ID,
+				Limit:  limit,
+			})
+			if err != nil {
+				fmt.Printf("Error getting bookmarks: %v\n", err)
+				fmt.Print("Press Enter to continue...")
+				reader.ReadString('\n')
+				continue
+			}
+
+			// Convert bookmarks to regular posts format
+			posts = make([]database.GetPostsForUserRow, len(bookmarks))
+			for i, bookmark := range bookmarks {
+				posts[i] = database.GetPostsForUserRow{
+					ID:          bookmark.ID,
+					CreatedAt:   bookmark.CreatedAt,
+					UpdatedAt:   bookmark.UpdatedAt,
+					Title:       bookmark.Title,
+					Url:         bookmark.Url,
+					Description: bookmark.Description,
+					PublishedAt: bookmark.PublishedAt,
+					FeedID:      bookmark.FeedID,
+					FeedName:    bookmark.FeedName,
+				}
+			}
+
+		default:
+			// Try to parse as post number
+			if postNum, err := strconv.Atoi(input); err == nil && postNum >= 1 && postNum <= len(posts) {
+				post := posts[postNum-1]
+				fmt.Printf("\nOpening: %s\n", post.Title)
+				fmt.Printf("URL: %s\n", post.Url)
+
+				if err := openURL(post.Url); err != nil {
+					fmt.Printf("Error opening URL: %v\n", err)
+					fmt.Printf("Please open this URL manually: %s\n", post.Url)
+				} else {
+					fmt.Println("Opened in browser!")
+				}
+
+				fmt.Print("Press Enter to continue...")
+				reader.ReadString('\n')
+			} else {
+				fmt.Println("Invalid command. Press Enter to continue...")
+				reader.ReadString('\n')
+			}
+		}
+	}
 }
 
 func main() {
@@ -407,6 +853,11 @@ func main() {
 	cmds.register("following", middlewareLoggedIn(handlerFollowing))
 	cmds.register("unfollow", middlewareLoggedIn(handlerUnfollow))
 	cmds.register("browse", middlewareLoggedIn(handlerBrowse))
+	cmds.register("search", middlewareLoggedIn(handlerSearch))
+	cmds.register("bookmark", middlewareLoggedIn(handlerBookmark))
+	cmds.register("unbookmark", middlewareLoggedIn(handlerUnbookmark))
+	cmds.register("bookmarks", middlewareLoggedIn(handlerBookmarks))
+	cmds.register("tui", middlewareLoggedIn(handlerTUI))
 
 	// Get command-line arguments
 	args := os.Args

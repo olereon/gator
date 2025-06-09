@@ -59,8 +59,20 @@ Gator provides several commands to manage RSS feeds and users:
 - `gator unfollow <url>` - Unfollow a feed
 
 ### Content Aggregation
-- `gator agg <time_interval>` - Start continuous feed aggregation (e.g., `gator agg 30s`)
-- `gator browse` - View the latest posts from feeds you follow
+- `gator agg <time_interval> [concurrency]` - Start continuous feed aggregation (e.g., `gator agg 30s 10`)
+- `gator browse [options]` - View posts from feeds you follow with advanced options:
+  - `--limit=N` - Number of posts to show (default: 10)
+  - `--offset=N` - Number of posts to skip for pagination (default: 0)
+  - `--sort=OPTION` - Sort by: published_desc, published, title, title_desc, feed, feed_desc
+  - `--feed=NAME` - Filter by feed name (partial match)
+  - `--help` - Show help for browse command
+- `gator search <query>` - Search posts by title, description, or feed name
+- `gator tui` - Interactive terminal interface for browsing and opening posts
+
+### Bookmarks
+- `gator bookmark <post_url>` - Bookmark a post for later reading
+- `gator unbookmark <post_url>` - Remove a bookmark
+- `gator bookmarks [limit]` - View your bookmarked posts
 
 ## Example Workflow
 
@@ -75,15 +87,39 @@ Gator provides several commands to manage RSS feeds and users:
    gator addfeed "Hacker News" "https://hnrss.org/frontpage"
    ```
 
-3. Start aggregating feeds:
+3. Start aggregating feeds with concurrency:
    ```bash
-   gator agg 1m
+   gator agg 1m 5
    ```
 
-4. In another terminal, browse the latest posts:
+4. Browse and interact with posts:
    ```bash
-   gator browse
+   # Browse latest posts with pagination
+   gator browse --limit=20 --sort=published_desc
+   
+   # Search for specific content
+   gator search "golang programming"
+   
+   # Use interactive TUI
+   gator tui
+   
+   # Bookmark interesting posts
+   gator bookmark "https://example.com/article"
+   
+   # View your bookmarks
+   gator bookmarks
    ```
+
+## Features
+
+- **Multi-user Support**: Register and manage multiple users
+- **RSS Feed Management**: Add, follow, and unfollow RSS feeds
+- **Concurrent Aggregation**: Fetch multiple feeds simultaneously for faster updates
+- **Advanced Search**: Full-text search across post titles, descriptions, and feed names
+- **Bookmarking**: Save interesting posts for later reading
+- **Interactive TUI**: Terminal user interface for easy post browsing and opening
+- **Flexible Browsing**: Sort, filter, and paginate through posts
+- **Cross-platform**: Works on Windows, macOS, and Linux
 
 ## Architecture
 
@@ -91,6 +127,7 @@ Gator provides several commands to manage RSS feeds and users:
 - **Database**: PostgreSQL with SQLC for type-safe queries
 - **Configuration**: JSON-based configuration stored at `~/.gatorconfig.json`
 - **RSS Parsing**: Custom RSS parser for fetching and parsing feed content
+- **Concurrency**: Goroutines for parallel feed fetching
 
 ## Project Structure
 
